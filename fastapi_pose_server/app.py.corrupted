@@ -1,0 +1,1252 @@
+import io
+import os
+import time
+from typing import Dict, Tuple, Optional
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import base64
+import tempfile
+
+try:
+    import mediapipe as mp
+except Exception as e:
+    raise RuntimeError("Install mediapipe in your Python env: pip install mediapipe")
+
+# MediaPipe Hands for finger counting
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    model_complexity=1,
+    max_num_hands=2,
+    min_detection_confidence=0.3,
+    min_tracking_confidence=0.3,
+)
+
+app = FastAPI(title="Pose Server (MediaPipe)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mp_pose = mp.solutions.pose
+# Relax confidences to improve initial detection
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=0,
+    smooth_landmarks=False,
+    enable_segmentation=False,
+    min_detection_confidence=0.25,
+    min_tracking_confidence=0.25,
+)
+
+# Landmark indices for convenience (MediaPipe Pose)
+LM = mp.solutions.pose.PoseLandmark
+
+
+class InferResponse(BaseModel):
+    suggested_state: str
+    feet_apart: float
+    fps: float
+    detected: bool
+    # Minimal set of landmarks (normalized 0..1) as objects {x,y}
+    landmarks: Dict[str, Dict[str, float]]
+
+
+def compute_metrics(lm_list, h, w):
+    LM = mp_pose.PoseLandmark
+    def pt(idx):
+        lm = lm_list[idx]
+        return lm.x, lm.y
+
+    pts = {}
+    try:
+        pts["l_shoulder"] = pt(LM.LEFT_SHOULDER.value)
+        pts["r_shoulder"] = pt(LM.RIGHT_SHOULDER.value)
+        pts["l_hip"] = pt(LM.LEFT_HIP.value)
+        pts["r_hip"] = pt(LM.RIGHT_HIP.value)
+        pts["l_wrist"] = pt(LM.LEFT_WRIST.value)
+        pts["r_wrist"] = pt(LM.RIGHT_WRIST.value)
+        pts["l_ankle"] = pt(LM.LEFT_ANKLE.value)
+        pts["r_ankle"] = pt(LM.RIGHT_ANKLE.value)
+        pts["nose"] = pt(LM.NOSE.value)
+    except Exception:
+        return None
+
+    def dist(a, b):
+        ax, ay = a
+        bx, by = b
+        return np.hypot(ax - bx, ay - by)
+
+    shoulder_width = max(1e-3, dist(pts["l_shoulder"], pts["r_shoulder"]))
+    hip_y = (pts["l_hip"][1] + pts["r_hip"][1]) / 2.0
+    head_y = pts["nose"][1]
+    wrist_y_mean = (pts["l_wrist"][1] + pts["r_wrist"][1]) / 2.0
+    feet_apart = dist(pts["l_ankle"], pts["r_ankle"]) / shoulder_width
+    shoulder_y = (pts["l_shoulder"][1] + pts["r_shoulder"][1]) / 2.0
+    nose_shoulder_span = max(1e-3, abs(head_y - shoulder_y))
+
+    return {
+        "feet_apart": feet_apart,
+        "wrist_y_mean": wrist_y_mean,
+        "head_y": head_y,
+        "hip_y": hip_y,
+        "nose_shoulder_span": nose_shoulder_span,
+        "pts": pts,
+    }
+
+
+def evaluate_state(metrics, open_feet=1.8, close_feet=0.8, open_hands=0.15, close_hands=0.15):
+    feet_apart = metrics["feet_apart"]
+    wrist_y_mean = metrics["wrist_y_mean"]
+    head_y = metrics["head_y"]
+    hip_y = metrics["hip_y"]
+    nose_shoulder_span = metrics["nose_shoulder_span"]
+    hands_up = wrist_y_mean < (head_y - open_hands * nose_shoulder_span)
+    hands_down = wrist_y_mean > (hip_y + close_hands * nose_shoulder_span)
+    if hands_up and feet_apart >= open_feet:
+        return "OPEN"
+    if hands_down and feet_apart <= close_feet:
+        return "CLOSE"
+    return "MID"
+
+
+@app.post("/infer", response_model=InferResponse)
+async def infer(
+    file: UploadFile = File(...),
+    flip: Optional[int] = Form(default=0),  # set to 1 for front camera mirroring
+):
+    t0 = time.time()
+    data = await file.read()
+
+    # Decode bytes -> BGR
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return InferResponse(suggested_state="NONE", feet_apart=0.0, fps=0.0, detected=False, landmarks={})
+
+    # Downscale for speed if large
+    h, w = img.shape[:2]
+    max_w = 160
+    if w > max_w:
+        scale = max_w / float(w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        h, w = img.shape[:2]
+
+    # Optional horizontal flip for front camera
+    if flip:
+        img = cv2.flip(img, 1)
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = pose.process(rgb)
+
+    lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+    metrics = None
+    if lm is not None:
+        metrics = compute_metrics(lm, h, w)
+
+    if metrics is None:
+        fps = 1.0 / max(1e-6, time.time() - t0)
+        return InferResponse(suggested_state="NONE", feet_apart=0.0, fps=fps, detected=False, landmarks={})
+
+    state = evaluate_state(metrics)
+    fps = 1.0 / max(1e-6, time.time() - t0)
+
+    # Return minimal normalized landmarks for overlay if needed
+    pts = metrics["pts"]
+    def obj(p):
+        return {"x": float(p[0]), "y": float(p[1])}
+    landmarks = {
+        "l_shoulder": obj(pts["l_shoulder"]),
+        "r_shoulder": obj(pts["r_shoulder"]),
+        "l_hip": obj(pts["l_hip"]),
+        "r_hip": obj(pts["r_hip"]),
+        "l_wrist": obj(pts["l_wrist"]),
+        "r_wrist": obj(pts["r_wrist"]),
+        "l_ankle": obj(pts["l_ankle"]),
+        "r_ankle": obj(pts["r_ankle"]),
+        "nose": obj(pts["nose"]),
+    }
+
+    return InferResponse(
+        suggested_state=state,
+        feet_apart=float(metrics["feet_apart"]),
+        fps=fps,
+        detected=True,
+        landmarks=landmarks,
+    )
+
+
+# ---------------------- Jumping Jacks (server-side) ----------------------
+class JacksResponse(BaseModel):
+    reps: int
+    phase: str
+    fps: float
+    detected: bool
+    landmarks: Dict[str, Dict[str, float]]
+    feet_apart: float
+    hands_up: bool
+    hands_down: bool
+
+
+# Per-session state
+_sessions: Dict[str, Dict[str, int | str]] = {}
+
+
+def _update_session(session_id: str, suggested: str) -> Tuple[int, str]:
+    s = _sessions.get(session_id, {"reps": 0, "phase": "INIT"})
+    phase = s["phase"]  # type: ignore
+    reps = int(s["reps"])  # type: ignore
+    if (phase in ("INIT", "CLOSE")) and suggested == "OPEN":
+        phase = "OPEN"
+    elif phase == "OPEN" and suggested == "CLOSE":
+        phase = "CLOSE"
+        reps += 1
+    s["phase"], s["reps"] = phase, reps
+    _sessions[session_id] = s
+    return reps, phase  # type: ignore
+
+
+@app.post("/jacks", response_model=JacksResponse)
+async def jacks(
+    file: UploadFile = File(...),
+    flip: Optional[int] = Form(default=0),
+    session: Optional[str] = Form(default="default"),
+):
+    t0 = time.time()
+    data = await file.read()
+
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return JacksResponse(reps=0, phase="INIT", fps=0.0, detected=False, landmarks={}, feet_apart=0.0, hands_up=False, hands_down=False)
+
+    h, w = img.shape[:2]
+    max_w = 160
+    if w > max_w:
+        scale = max_w / float(w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        h, w = img.shape[:2]
+
+    if flip:
+        img = cv2.flip(img, 1)
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = pose.process(rgb)
+
+    lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+    if not lm:
+        fps = 1.0 / max(1e-6, time.time() - t0)
+        session_data = _sessions.get(session or "default", {})
+        return JacksResponse(
+            reps=int(session_data.get("reps", 0)), 
+            phase=str(session_data.get("phase", "INIT")), 
+            fps=fps, 
+            detected=False, 
+            landmarks={},
+            feet_apart=0.0,
+            hands_up=False,
+            hands_down=False
+        )
+
+    metrics = compute_metrics(lm, h, w)
+    if metrics is None:
+        fps = 1.0 / max(1e-6, time.time() - t0)
+        session_data = _sessions.get(session or "default", {})
+        return JacksResponse(
+            reps=int(session_data.get("reps", 0)), 
+            phase=str(session_data.get("phase", "INIT")), 
+            fps=fps, 
+            detected=False, 
+            landmarks={},
+            feet_apart=0.0,
+            hands_up=False,
+            hands_down=False
+        )
+        
+    # More permissive thresholds to exit INIT quickly
+    state = evaluate_state(metrics, open_feet=1.2, close_feet=0.6, open_hands=0.05, close_hands=0.05)
+    reps, phase = _update_session(session or "default", state)
+    fps = 1.0 / max(1e-6, time.time() - t0)
+
+    pts = metrics["pts"]
+    def obj(p):
+        return {"x": float(p[0]), "y": float(p[1])}
+    landmarks = {
+        "l_shoulder": obj(pts["l_shoulder"]),
+        "r_shoulder": obj(pts["r_shoulder"]),
+        "l_hip": obj(pts["l_hip"]),
+        "r_hip": obj(pts["r_hip"]),
+        "l_wrist": obj(pts["l_wrist"]),
+        "r_wrist": obj(pts["r_wrist"]),
+        "l_ankle": obj(pts["l_ankle"]),
+        "r_ankle": obj(pts["r_ankle"]),
+        "nose": obj(pts["nose"]),
+    }
+
+    # Debug flags
+    feet_apart = float(metrics["feet_apart"])
+    wrist_y_mean = metrics["wrist_y_mean"]
+    head_y = metrics["head_y"]
+    hip_y = metrics["hip_y"]
+    nose_shoulder_span = metrics["nose_shoulder_span"]
+    hands_up = wrist_y_mean < (head_y - 0.05 * nose_shoulder_span)
+    hands_down = wrist_y_mean > (hip_y + 0.05 * nose_shoulder_span)
+
+    return JacksResponse(
+        reps=reps,
+        phase=phase,
+        fps=fps,
+        detected=True,
+        landmarks=landmarks,
+        feet_apart=feet_apart,
+        hands_up=bool(hands_up),
+        hands_down=bool(hands_down),
+    )
+
+
+class FingersResponse(BaseModel):
+    detected: bool
+    fingers: int
+    handedness: str | None
+    fps: float
+
+
+def count_fingers(landmarks, handedness_label: str) -> int:
+    # landmarks: list of 21 points with x,y in normalized coords
+    # Heuristic: For index/middle/ring/pinky, tip is above PIP (smaller y) when extended.
+    # For thumb, use x direction based on handedness.
+    TIP = [mp_hands.HandLandmark.THUMB_TIP,
+           mp_hands.HandLandmark.INDEX_FINGER_TIP,
+           mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+           mp_hands.HandLandmark.RING_FINGER_TIP,
+           mp_hands.HandLandmark.PINKY_TIP]
+    PIP = [mp_hands.HandLandmark.THUMB_IP,
+           mp_hands.HandLandmark.INDEX_FINGER_PIP,
+           mp_hands.HandLandmark.MIDDLE_FINGER_PIP,
+           mp_hands.HandLandmark.RING_FINGER_PIP,
+           mp_hands.HandLandmark.PINKY_PIP]
+
+    # y grows downward in image coords
+    count = 0
+    # Non-thumb fingers
+    for i in [1, 2, 3, 4]:
+        if landmarks[TIP[i]].y < landmarks[PIP[i]].y:
+            count += 1
+
+    # Thumb: compare x based on handedness
+    if handedness_label.lower().startswith('right'):
+        if landmarks[TIP[0]].x < landmarks[PIP[0]].x:
+            count += 1
+    else:  # left
+        if landmarks[TIP[0]].x > landmarks[PIP[0]].x:
+            count += 1
+    return count
+
+
+@app.post("/fingers", response_model=FingersResponse)
+async def fingers(
+    file: UploadFile = File(...),
+    flip: Optional[int] = Form(default=0),
+):
+    t0 = time.time()
+    data = await file.read()
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return FingersResponse(detected=False, fingers=0, handedness=None, fps=0.0)
+
+    h, w = img.shape[:2]
+    max_w = 320
+    if w > max_w:
+        scale = max_w / float(w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+    if flip:
+        img = cv2.flip(img, 1)
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb)
+    fps = 1.0 / max(1e-6, time.time() - t0)
+
+    if not result.multi_hand_landmarks or not result.multi_handedness:
+        return FingersResponse(detected=False, fingers=0, handedness=None, fps=fps)
+
+    # Use first hand
+    hand_lm = result.multi_hand_landmarks[0].landmark
+    hand_label = result.multi_handedness[0].classification[0].label  # 'Left' or 'Right'
+    fingers = count_fingers(hand_lm, hand_label)
+    return FingersResponse(detected=True, fingers=int(fingers), handedness=hand_label, fps=fps)
+
+
+# ---------------------- Offline Video Analysis ----------------------
+class AnalyzeResponse(BaseModel):
+    reps: int
+    frames: int
+    duration_s: float
+    processed_fps: float
+    reps_perfect: int
+    reps_wrong: int
+    diagnostics: list | None = None
+
+
+def _draw_overlay(img, pts: Dict[str, Tuple[float, float]], messages: list[str]):
+    # pts are normalized; draw simple skeleton and messages
+    h, w = img.shape[:2]
+    def denorm(p):
+        return int(max(0, min(1, p[0])) * w), int(max(0, min(1, p[1])) * h)
+    # Key connections
+    lines = [
+        ("l_shoulder", "r_shoulder"),
+        ("l_shoulder", "l_hip"),
+        ("r_shoulder", "r_hip"),
+        ("l_hip", "r_hip"),
+        ("l_shoulder", "l_wrist"),
+        ("r_shoulder", "r_wrist"),
+        ("l_hip", "l_ankle"),
+        ("r_hip", "r_ankle"),
+    ]
+    for a, b in lines:
+        if a in pts and b in pts:
+            pa = denorm(pts[a]); pb = denorm(pts[b])
+            cv2.line(img, pa, pb, (0, 255, 0), 2)
+    for k, p in pts.items():
+        cv2.circle(img, denorm(p), 3, (255, 0, 0), -1)
+    # Put messages at top-left
+    y = 20
+    for m in messages:
+        cv2.putText(img, m, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        y += 22
+    # Encode to JPEG b64
+    ok, buf = cv2.imencode('.jpg', img)
+    if not ok:
+        return None
+    return base64.b64encode(buf.tobytes()).decode('ascii')
+
+
+def _count_jacks_in_video(path: str, flip: bool = False, sample_stride: int = 2) -> Tuple[int, int, float, int, int, list]:
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0, 0, 0.0, 0, 0, []
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = total_frames / fps if fps > 0 else 0.0
+
+    reps = 0
+    reps_perfect = 0
+    reps_wrong = 0
+    phase = "INIT"
+    processed = 0
+    idx = 0
+    # Track quality across an OPEN->CLOSE cycle
+    open_ok = False
+    close_ok = False
+    diagnostics: list = []
+    # store a representative frame and pts for current rep
+    last_open_snapshot = None  # (frame_bgr, pts)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if sample_stride > 1 and (idx % sample_stride) != 0:
+            idx += 1
+            continue
+        idx += 1
+        if flip:
+            frame = cv2.flip(frame, 1)
+
+        # Resize to speed up
+        h, w = frame.shape[:2]
+        max_w = 160
+        if w > max_w:
+            scale = max_w / float(w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            h, w = frame.shape[:2]
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+        if not lm:
+            continue
+
+        metrics = compute_metrics(lm, h, w)
+        if metrics is None:
+            continue
+            
+        state = evaluate_state(metrics, open_feet=1.2, close_feet=0.6, open_hands=0.05, close_hands=0.05)
+
+        # Strict quality checks
+        feet_apart = float(metrics.get("feet_apart", 0.0)) if metrics else 0.0
+        wrist_y_mean = metrics.get("wrist_y_mean", 0.0) if metrics else 0.0
+        head_y = metrics.get("head_y", 0.0) if metrics else 0.0
+        hip_y = metrics.get("hip_y", 1.0) if metrics else 1.0
+        span = metrics.get("nose_shoulder_span", 0.3) if metrics else 0.3
+        hands_up_strict = wrist_y_mean < (head_y - 0.10 * span)
+        hands_down_strict = wrist_y_mean > (hip_y + 0.08 * span)
+        feet_open_strict = feet_apart >= 1.4
+        feet_close_strict = feet_apart <= 0.5
+
+        # Simple local state machine (not using session)
+        if (phase in ("INIT", "CLOSE")) and state == "OPEN":
+            phase = "OPEN"
+            # capture open quality at peak
+            open_ok = hands_up_strict and feet_open_strict
+            close_ok = False
+            # snapshot frame and pts for diagnostics
+            pts = metrics["pts"]
+            last_open_snapshot = (frame.copy(), pts)
+        elif phase == "OPEN" and state == "CLOSE":
+            reps += 1
+            # capture close quality at finish
+            close_ok = hands_down_strict and feet_close_strict
+            if open_ok and close_ok:
+                reps_perfect += 1
+            else:
+                reps_wrong += 1
+                # build description and annotated image using stored OPEN snapshot if available
+                issues = []
+                if not hands_up_strict:
+                    issues.append("Hands not high enough at OPEN")
+                if not feet_open_strict:
+                    issues.append("Feet not wide enough at OPEN")
+                if not hands_down_strict:
+                    issues.append("Hands not down at CLOSE")
+                if not feet_close_strict:
+                    issues.append("Feet not together at CLOSE")
+                img_b64 = None
+                if last_open_snapshot is not None:
+                    snap_img, snap_pts = last_open_snapshot
+                    img_b64 = _draw_overlay(snap_img, snap_pts, issues)
+                diagnostics.append({
+                    "rep_index": int(reps),
+                    "description": "; ".join(issues) if issues else "Form deviation",
+                    "image_b64": img_b64,
+                })
+            phase = "CLOSE"
+
+        processed += 1
+
+    cap.release()
+    proc_fps = processed / duration if duration > 0 else 0.0
+    return reps, processed, duration, reps_perfect, reps_wrong, diagnostics
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_video(file: UploadFile = File(...), flip: Optional[int] = Form(default=0)):
+    # Persist upload to a temp file for OpenCV
+    data = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "video.mp4")[1] or ".mp4") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        reps, processed, duration, reps_perfect, reps_wrong, diagnostics = _count_jacks_in_video(tmp_path, flip=bool(flip), sample_stride=2)
+        proc_fps = processed / duration if duration > 0 else 0.0
+        return AnalyzeResponse(
+            reps=int(reps),
+            frames=int(processed),
+            duration_s=float(duration),
+            processed_fps=float(proc_fps),
+            reps_perfect=int(reps_perfect),
+            reps_wrong=int(reps_wrong),
+            diagnostics=diagnostics,
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+# ---------------------- WebSocket: Jumping Jacks ----------------------
+@app.websocket("/ws/jacks")
+async def ws_jacks(websocket: WebSocket):
+    await websocket.accept()
+    print("[WS] /ws/jacks connected from:", websocket.client)
+    # Query params: flip, session
+    params = websocket.query_params
+    flip_q = params.get("flip", "0")
+    session_id = params.get("session", "default")
+    flip_flag = 1 if str(flip_q) == "1" else 0
+
+    try:
+        while True:
+            # Expect text JSON: {"jpg_b64": "..."}
+            msg = await websocket.receive_json()
+            t0 = time.time()
+            b64 = msg.get("jpg_b64")
+            if not b64:
+                await websocket.send_json({"error": "missing jpg_b64"})
+                continue
+
+            # Decode JPEG
+            try:
+                img = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
+            except Exception:
+                await websocket.send_json({"error": "decode_failed"})
+                continue
+            if img is None:
+                await websocket.send_json({"error": "imdecode_failed"})
+                continue
+
+            h, w = img.shape[:2]
+            max_w = 160
+            if w > 0:
+                scale = 160.0 / max(1.0, float(w))
+                if scale < 1.0:
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)))
+                    h, w = img.shape[:2]
+
+            if flip_flag:
+                img = cv2.flip(img, 1)
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb)
+            lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+            if not lm:
+                fps = 1.0 / max(1e-6, time.time() - t0)
+                await websocket.send_json({
+                    "reps": int(_sessions.get(session_id, {}).get("reps", 0)),
+                    "phase": str(_sessions.get(session_id, {}).get("phase", "INIT")),
+                    "fps": fps,
+                    "detected": False,
+                    "landmarks": {},
+                })
+                continue
+
+            metrics = compute_metrics(lm, h, w)
+            state = evaluate_state(metrics, open_feet=1.2, close_feet=0.6, open_hands=0.05, close_hands=0.05)
+            reps, phase = _update_session(session_id, state)
+            fps = 1.0 / max(1e-6, time.time() - t0)
+
+            pts = metrics["pts"]
+            def obj(p):
+                return {"x": float(p[0]), "y": float(p[1])}
+            landmarks = {
+                "l_shoulder": obj(pts["l_shoulder"]),
+                "r_shoulder": obj(pts["r_shoulder"]),
+                "l_hip": obj(pts["l_hip"]),
+                "r_hip": obj(pts["r_hip"]),
+                "l_wrist": obj(pts["l_wrist"]),
+                "r_wrist": obj(pts["r_wrist"]),
+                "l_ankle": obj(pts["l_ankle"]),
+                "r_ankle": obj(pts["r_ankle"]),
+                "nose": obj(pts["nose"]),
+            }
+
+            await websocket.send_json({
+                "reps": reps,
+                "phase": phase,
+                "fps": fps,
+                "detected": True,
+                "landmarks": landmarks,
+            })
+
+    except WebSocketDisconnect:
+        print("[WS] /ws/jacks disconnected:", websocket.client)
+        return
+
+
+# ---------------------- WebSocket: Pushups ----------------------
+@app.websocket("/ws/pushups")
+async def ws_pushups(websocket: WebSocket):
+    await websocket.accept()
+    print("[WS] /ws/pushups connected from:", websocket.client)
+    # Query params: flip, session
+    params = websocket.query_params
+    flip_q = params.get("flip", "0")
+    session_id = params.get("session", "default")
+    flip_flag = 1 if str(flip_q) == "1" else 0
+
+    try:
+        while True:
+            # Expect text JSON: {"jpg_b64": "..."}
+            msg = await websocket.receive_json()
+            t0 = time.time()
+            b64 = msg.get("jpg_b64")
+            if not b64:
+                await websocket.send_json({"error": "missing jpg_b64"})
+                continue
+
+            # Decode JPEG
+            try:
+                img = cv2.imdecode(np.frombuffer(base64.b64decode(b64), np.uint8), cv2.IMREAD_COLOR)
+            except Exception:
+                await websocket.send_json({"error": "decode_failed"})
+                continue
+            if img is None:
+                await websocket.send_json({"error": "imdecode_failed"})
+                continue
+
+            h, w = img.shape[:2]
+            max_w = 160
+            if w > 0:
+                scale = 160.0 / max(1.0, float(w))
+                if scale < 1.0:
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)))
+                    h, w = img.shape[:2]
+
+            if flip_flag:
+                img = cv2.flip(img, 1)
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb)
+            lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+            if not lm:
+                fps = 1.0 / max(1e-6, time.time() - t0)
+                session_data = _pushup_sessions.get(session_id, {})
+                await websocket.send_json({
+                    "reps": int(session_data.get("reps", 0)),
+                    "phase": str(session_data.get("phase", "INIT")),
+                    "fps": fps,
+                    "detected": False,
+                    "landmarks": {},
+                    "body_angle": 0.0,
+                    "arms_angle": 0.0,
+                    "is_down": False,
+                    "is_up": False,
+                })
+                continue
+
+            # Extended metrics for pushups
+            def pt(idx):
+                lm_pt = lm[idx]
+                return lm_pt.x, lm_pt.y
+
+            pts = {}
+            try:
+                pts["l_shoulder"] = pt(LM.LEFT_SHOULDER.value)
+                pts["r_shoulder"] = pt(LM.RIGHT_SHOULDER.value)
+                pts["l_hip"] = pt(LM.LEFT_HIP.value)
+                pts["r_hip"] = pt(LM.RIGHT_HIP.value)
+                pts["l_wrist"] = pt(LM.LEFT_WRIST.value)
+                pts["r_wrist"] = pt(LM.RIGHT_WRIST.value)
+                pts["l_ankle"] = pt(LM.LEFT_ANKLE.value)
+                pts["r_ankle"] = pt(LM.RIGHT_ANKLE.value)
+                pts["l_elbow"] = pt(LM.LEFT_ELBOW.value)
+                pts["r_elbow"] = pt(LM.RIGHT_ELBOW.value)
+                pts["nose"] = pt(LM.NOSE.value)
+            except Exception:
+                fps = 1.0 / max(1e-6, time.time() - t0)
+                session_data = _pushup_sessions.get(session_id, {})
+                await websocket.send_json({
+                    "reps": int(session_data.get("reps", 0)),
+                    "phase": str(session_data.get("phase", "INIT")),
+                    "fps": fps,
+                    "detected": False,
+                    "landmarks": {},
+                    "body_angle": 0.0,
+                    "arms_angle": 0.0,
+                    "is_down": False,
+                    "is_up": False,
+                })
+                continue
+
+            def dist(a, b):
+                ax, ay = a
+                bx, by = b
+                return np.hypot(ax - bx, ay - by)
+
+            shoulder_width = max(1e-3, dist(pts["l_shoulder"], pts["r_shoulder"]))
+
+            # Calculate body angle for pushup detection
+            shoulder_y = (pts["l_shoulder"][1] + pts["r_shoulder"][1]) / 2.0
+            hip_y = (pts["l_hip"][1] + pts["r_hip"][1]) / 2.0
+            ankle_y = (pts["l_ankle"][1] + pts["r_ankle"][1]) / 2.0
+
+            shoulder_ankle_mid_y = (shoulder_y + ankle_y) / 2.0
+            body_deviation = abs(hip_y - shoulder_ankle_mid_y)
+            body_angle = body_deviation / shoulder_width
+
+            # Calculate arm angle (simplified)
+            shoulder_hip_dist = abs(shoulder_y - hip_y)
+            arms_angle = shoulder_hip_dist / shoulder_width
+
+            metrics = {
+                "pts": pts,
+                "shoulder_width": shoulder_width,
+                "body_angle": body_angle,
+                "arms_angle": arms_angle
+            }
+
+            # Evaluate pushup state
+            state = evaluate_pushup_state(metrics)
+            reps, phase = _update_pushup_session(session_id, state)
+            fps = 1.0 / max(1e-6, time.time() - t0)
+
+            def obj(p):
+                return {"x": float(p[0]), "y": float(p[1])}
+            landmarks = {
+                "l_shoulder": obj(pts["l_shoulder"]),
+                "r_shoulder": obj(pts["r_shoulder"]),
+                "l_hip": obj(pts["l_hip"]),
+                "r_hip": obj(pts["r_hip"]),
+                "l_wrist": obj(pts["l_wrist"]),
+                "r_wrist": obj(pts["r_wrist"]),
+                "l_ankle": obj(pts["l_ankle"]),
+                "r_ankle": obj(pts["r_ankle"]),
+                "l_elbow": obj(pts["l_elbow"]),
+                "r_elbow": obj(pts["r_elbow"]),
+                "nose": obj(pts["nose"]),
+            }
+
+            # Debug flags
+            is_down = state == "DOWN"
+            is_up = state == "UP"
+
+            await websocket.send_json({
+                "reps": reps,
+                "phase": phase,
+                "fps": fps,
+                "detected": True,
+                "landmarks": landmarks,
+                "body_angle": float(body_angle),
+                "arms_angle": float(arms_angle),
+                "is_down": bool(is_down),
+                "is_up": bool(is_up),
+            })
+
+    except WebSocketDisconnect:
+        print("[WS] /ws/pushups disconnected:", websocket.client)
+        return
+
+
+# ---------------------- Pushups (server-side) ----------------------
+class PushupResponse(BaseModel):
+    reps: int
+    phase: str
+    fps: float
+    detected: bool
+    landmarks: Dict[str, Dict[str, float]]
+    body_angle: float
+    arms_angle: float
+    is_down: bool
+    is_up: bool
+
+
+# Per-session state for pushups
+_pushup_sessions: Dict[str, Dict[str, int | str]] = {}
+
+
+def _count_pushups_in_video(path: str, flip: bool = False, sample_stride: int = 2) -> Tuple[int, int, float, int, dict]:
+    """Process entire video and count pushups"""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0, 0, 0.0, 0, {}
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = total_frames / fps if fps > 0 else 0.0
+    
+    reps = 0
+    phase = "INIT"
+    processed = 0
+    idx = 0
+    
+    # For diagnostics, track some stats
+    diagnostics = {
+        "max_body_angle": 0.0,
+        "min_body_angle": 1.0,
+        "max_arm_angle": 0.0,
+        "min_arm_angle": 1.0
+    }
+    
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if sample_stride > 1 and (idx % sample_stride) != 0:
+            idx += 1
+            continue
+        idx += 1
+        if flip:
+            frame = cv2.flip(frame, 1)
+            
+        # Resize to speed up
+        h, w = frame.shape[:2]
+        max_w = 160
+        if w > max_w:
+            scale = max_w / float(w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            h, w = frame.shape[:2]
+            
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+        if not lm:
+            continue
+            
+        # Extract points
+        def pt(idx):
+            lm_pt = lm[idx]
+            return lm_pt.x, lm_pt.y
+            
+        pts = {}
+        try:
+            pts["l_shoulder"] = pt(LM.LEFT_SHOULDER.value)
+            pts["r_shoulder"] = pt(LM.RIGHT_SHOULDER.value)
+            pts["l_hip"] = pt(LM.LEFT_HIP.value)
+            pts["r_hip"] = pt(LM.RIGHT_HIP.value)
+            pts["l_wrist"] = pt(LM.LEFT_WRIST.value)
+            pts["r_wrist"] = pt(LM.RIGHT_WRIST.value)
+            pts["l_ankle"] = pt(LM.LEFT_ANKLE.value)
+            pts["r_ankle"] = pt(LM.RIGHT_ANKLE.value)
+            pts["l_elbow"] = pt(LM.LEFT_ELBOW.value)
+            pts["r_elbow"] = pt(LM.RIGHT_ELBOW.value)
+            pts["nose"] = pt(LM.NOSE.value)
+        except Exception:
+            continue
+            
+        def dist(a, b):
+            ax, ay = a
+            bx, by = b
+            return np.hypot(ax - bx, ay - by)
+            
+        shoulder_width = max(1e-3, dist(pts["l_shoulder"], pts["r_shoulder"]))
+        
+        # Calculate body angle for pushup detection
+        shoulder_y = (pts["l_shoulder"][1] + pts["r_shoulder"][1]) / 2.0
+        hip_y = (pts["l_hip"][1] + pts["r_hip"][1]) / 2.0
+        ankle_y = (pts["l_ankle"][1] + pts["r_ankle"][1]) / 2.0
+        
+        shoulder_ankle_mid_y = (shoulder_y + ankle_y) / 2.0
+        body_deviation = abs(hip_y - shoulder_ankle_mid_y)
+        body_angle = body_deviation / shoulder_width
+        
+        # Calculate arm angle (simplified)
+        shoulder_hip_dist = abs(shoulder_y - hip_y)
+        arms_angle = shoulder_hip_dist / shoulder_width
+        
+        # Update diagnostics
+        diagnostics["max_body_angle"] = max(diagnostics["max_body_angle"], body_angle)
+        diagnostics["min_body_angle"] = min(diagnostics["min_body_angle"], body_angle)
+        diagnostics["max_arm_angle"] = max(diagnostics["max_arm_angle"], arms_angle)
+        diagnostics["min_arm_angle"] = min(diagnostics["min_arm_angle"], arms_angle)
+        
+        metrics = {
+            "pts": pts,
+            "shoulder_width": shoulder_width,
+            "body_angle": body_angle,
+            "arms_angle": arms_angle
+        }
+        
+        # Evaluate pushup state
+        state = evaluate_pushup_state(metrics)
+        
+        # Simple state machine for counting
+        if (phase in ("INIT", "UP")) and state == "DOWN":
+            phase = "DOWN"
+        elif phase == "DOWN" and state == "UP":
+            phase = "UP"
+            reps += 1
+            
+        processed += 1
+        
+    cap.release()
+    return reps, processed, duration, 0, diagnostics  # 0 for reps_wrong (not implemented yet)
+
+
+def _update_pushup_session(session_id: str, suggested: str) -> Tuple[int, str]:
+    s = _pushup_sessions.get(session_id, {"reps": 0, "phase": "INIT"})
+    phase = str(s["phase"])  # type: ignore
+    reps = int(s["reps"])  # type: ignore
+    if (phase in ("INIT", "UP")) and suggested == "DOWN":
+        phase = "DOWN"
+    elif phase == "DOWN" and suggested == "UP":
+        phase = "UP"
+        reps += 1
+    s["phase"], s["reps"] = phase, reps
+    _pushup_sessions[session_id] = s
+    return reps, phase  # type: ignore
+
+
+def evaluate_pushup_state(metrics):
+    """Evaluate pushup state based on body angles and positions"""
+    # Calculate body angle (shoulder to ankle line relative to horizontal)
+    shoulder_y = (metrics["pts"]["l_shoulder"][1] + metrics["pts"]["r_shoulder"][1]) / 2.0
+    hip_y = (metrics["pts"]["l_hip"][1] + metrics["pts"]["r_hip"][1]) / 2.0
+    ankle_y = (metrics["pts"]["l_ankle"][1] + metrics["pts"]["r_ankle"][1]) / 2.0
+    
+    # Calculate if body is straight (hips aligned with shoulder-ankle line)
+    shoulder_ankle_mid_y = (shoulder_y + ankle_y) / 2.0
+    body_deviation = abs(hip_y - shoulder_ankle_mid_y)
+    body_angle = body_deviation / metrics["shoulder_width"]  # Normalize by shoulder width
+    
+    # Calculate arm bend angle (using shoulder, elbow, wrist)
+    # For simplicity, we'll use a heuristic based on shoulder and hip position
+    shoulder_hip_dist = abs(shoulder_y - hip_y)
+    
+    # Determine if in down or up position
+    # Down position: body straight, arms bent (shoulder closer to hip)
+    # Up position: body straight, arms extended (shoulder farther from hip)
+    
+    # Even more permissive thresholds to improve detection
+    is_down = shoulder_hip_dist < metrics["shoulder_width"] * 0.7  # Even more relaxed threshold
+    is_up = shoulder_hip_dist > metrics["shoulder_width"] * 0.3   # Even more relaxed threshold
+    
+    # Even more permissive body angle check
+    if is_down and body_angle < 0.7:  # Much more permissive body straightness check
+        return "DOWN"
+    elif is_up and body_angle < 0.7:  # Much more permissive body straightness check
+        return "UP"
+    return "MID"
+
+
+@app.post("/pushups", response_model=PushupResponse)
+async def pushups(
+    file: UploadFile = File(...),
+    flip: Optional[int] = Form(default=0),
+    session: Optional[str] = Form(default="default"),
+):
+    # For single frame analysis (like real-time), use existing logic
+    # But for video analysis, we should process the entire video
+    # Let's check if this is a video file and process accordingly
+    
+    # Persist upload to a temp file for OpenCV
+    data = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "video.mp4")[1] or ".mp4") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        reps, processed, duration, reps_wrong, diagnostics = _count_pushups_in_video(tmp_path, flip=bool(flip), sample_stride=2)
+        proc_fps = processed / duration if duration > 0 else 0.0
+        
+        # Return a summary response similar to jumping jacks analysis
+        return PushupResponse(
+            reps=reps,
+            phase="COMPLETE",  # Indicate video analysis is complete
+            fps=proc_fps,
+            detected=True,
+            landmarks={},  # Not applicable for video summary
+            body_angle=diagnostics.get("max_body_angle", 0.0),
+            arms_angle=diagnostics.get("max_arm_angle", 0.0),
+            is_down=False,
+            is_up=False
+        )
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+# ---------------------- Diamond Pushups (server-side) ----------------------
+class DiamondPushupResponse(BaseModel):
+    reps: int
+    phase: str
+    fps: float
+    detected: bool
+    landmarks: Dict[str, Dict[str, float]]
+    body_angle: float
+    arms_angle: float
+    hand_distance: float
+    is_down: bool
+    is_up: bool
+
+
+@app.post("/diamond_pushups", response_model=DiamondPushupResponse)
+async def diamond_pushups(
+    file: UploadFile = File(...),
+    flip: Optional[int] = Form(default=0),
+    session: Optional[str] = Form(default="default"),
+):
+    # Persist upload to a temp file for OpenCV
+    data = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or "video.mp4")[1] or ".mp4") as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        reps, processed, duration, reps_wrong, diagnostics = _count_diamond_pushups_in_video(tmp_path, flip=bool(flip), sample_stride=2)
+        proc_fps = processed / duration if duration > 0 else 0.0
+        
+        # Return a summary response similar to jumping jacks analysis
+        return DiamondPushupResponse(
+            reps=reps,
+            phase="COMPLETE",  # Indicate video analysis is complete
+            fps=proc_fps,
+            detected=True,
+            landmarks={},  # Not applicable for video summary
+            body_angle=diagnostics.get("max_body_angle", 0.0),
+            arms_angle=diagnostics.get("max_arm_angle", 0.0),
+            hand_distance=diagnostics.get("min_hand_distance", 0.0),  # For diamond pushups, min distance is more relevant
+            is_down=False,
+            is_up=False
+        )
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+def _count_diamond_pushups_in_video(path: str, flip: bool = False, sample_stride: int = 2) -> Tuple[int, int, float, int, dict]:
+    """Process entire video and count diamond pushups specifically"""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return 0, 0, 0.0, 0, {}
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    duration = total_frames / fps if fps > 0 else 0.0
+    
+    reps = 0
+    phase = "INIT"
+    processed = 0
+    idx = 0
+    
+    # For diagnostics, track some stats
+    diagnostics = {
+        "max_body_angle": 0.0,
+        "min_body_angle": 1.0,
+        "max_arm_angle": 0.0,
+        "min_arm_angle": 1.0,
+        "max_hand_distance": 0.0,
+        "min_hand_distance": 1.0
+    }
+    
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if sample_stride > 1 and (idx % sample_stride) != 0:
+            idx += 1
+            continue
+        idx += 1
+        if flip:
+            frame = cv2.flip(frame, 1)
+            
+        # Resize to speed up
+        h, w = frame.shape[:2]
+        max_w = 160
+        if w > max_w:
+            scale = max_w / float(w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            h, w = frame.shape[:2]
+            
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        lm = results.pose_landmarks.landmark if results.pose_landmarks else None
+        if not lm:
+            continue
+            
+        # Extract points
+        def pt(idx):
+            lm_pt = lm[idx]
+            return lm_pt.x, lm_pt.y
+            
+        pts = {}
+        try:
+            pts["l_shoulder"] = pt(LM.LEFT_SHOULDER.value)
+            pts["r_shoulder"] = pt(LM.RIGHT_SHOULDER.value)
+            pts["l_hip"] = pt(LM.LEFT_HIP.value)
+            pts["r_hip"] = pt(LM.RIGHT_HIP.value)
+            pts["l_wrist"] = pt(LM.LEFT_WRIST.value)
+            pts["r_wrist"] = pt(LM.RIGHT_WRIST.value)
+            pts["l_ankle"] = pt(LM.LEFT_ANKLE.value)
+            pts["r_ankle"] = pt(LM.RIGHT_ANKLE.value)
+            pts["l_elbow"] = pt(LM.LEFT_ELBOW.value)
+            pts["r_elbow"] = pt(LM.RIGHT_ELBOW.value)
+            pts["nose"] = pt(LM.NOSE.value)
+        except Exception:
+            continue
+            
+        def dist(a, b):
+            ax, ay = a
+            bx, by = b
+            return np.hypot(ax - bx, ay - by)
+            
+        shoulder_width = max(1e-3, dist(pts["l_shoulder"], pts["r_shoulder"]))
+        # Calculate distance between wrists for diamond pushup detection
+        wrist_distance = dist(pts["l_wrist"], pts["r_wrist"])
+        
+        # Calculate body angle for pushup detection
+        shoulder_y = (pts["l_shoulder"][1] + pts["r_shoulder"][1]) / 2.0
+        hip_y = (pts["l_hip"][1] + pts["r_hip"][1]) / 2.0
+        ankle_y = (pts["l_ankle"][1] + pts["r_ankle"][1]) / 2.0
+        
+        shoulder_ankle_mid_y = (shoulder_y + ankle_y) / 2.0
+        body_deviation = abs(hip_y - shoulder_ankle_mid_y)
+        body_angle = body_deviation / shoulder_width
+        
+        # Calculate arm angle (simplified)
+        shoulder_hip_dist = abs(shoulder_y - hip_y)
+        arms_angle = shoulder_hip_dist / shoulder_width
+        
+        # Update diagnostics
+        diagnostics["max_body_angle"] = max(diagnostics["max_body_angle"], body_angle)
+        diagnostics["min_body_angle"] = min(diagnostics["min_body_angle"], body_angle)
+        diagnostics["max_arm_angle"] = max(diagnostics["max_arm_angle"], arms_angle)
+        diagnostics["min_arm_angle"] = min(diagnostics["min_arm_angle"], arms_angle)
+        diagnostics["max_hand_distance"] = max(diagnostics["max_hand_distance"], wrist_distance)
+        diagnostics["min_hand_distance"] = min(diagnostics["min_hand_distance"], wrist_distance)
+        
+        metrics = {
+            "pts": pts,
+            "shoulder_width": shoulder_width,
+            "body_angle": body_angle,
+            "arms_angle": arms_angle,
+            "wrist_distance": wrist_distance
+        }
+        
+        # Evaluate diamond pushup state
+        state = evaluate_diamond_pushup_state(metrics)
+        
+        # Simple state machine for counting
+        if (phase in ("INIT", "UP")) and state == "DOWN":
+            phase = "DOWN"
+        elif phase == "DOWN" and state == "UP":
+            phase = "UP"
+            reps += 1
+            
+        processed += 1
+        
+    cap.release()
+    return reps, processed, duration, 0, diagnostics  # 0 for reps_wrong (not implemented yet)
+
+
+def evaluate_diamond_pushup_state(metrics):
+    """Evaluate diamond pushup state based on body angles and hand positioning"""
+    # Calculate body angle (shoulder to ankle line relative to horizontal)
+    shoulder_y = (metrics["pts"]["l_shoulder"][1] + metrics["pts"]["r_shoulder"][1]) / 2.0
+    hip_y = (metrics["pts"]["l_hip"][1] + metrics["pts"]["r_hip"][1]) / 2.0
+    ankle_y = (metrics["pts"]["l_ankle"][1] + metrics["pts"]["r_ankle"][1]) / 2.0
+    
+    # Calculate if body is straight (hips aligned with shoulder-ankle line)
+    shoulder_ankle_mid_y = (shoulder_y + ankle_y) / 2.0
+    body_deviation = abs(hip_y - shoulder_ankle_mid_y)
+    body_angle = body_deviation / metrics["shoulder_width"]  # Normalize by shoulder width
+    
+    # Calculate arm bend angle (using shoulder, elbow, wrist)
+    shoulder_hip_dist = abs(shoulder_y - hip_y)
+    
+    # Check if hands are close together (diamond pushup characteristic)
+    # In diamond pushups, wrist distance should be much smaller than shoulder width
+    wrist_distance = metrics["wrist_distance"]
+    shoulder_width = metrics["shoulder_width"]
+    hands_close = wrist_distance < shoulder_width * 0.4  # Hands should be less than 40% of shoulder width apart
+    
+    # Determine if in down or up position
+    # Down position: body straight, arms bent (shoulder closer to hip)
+    # Up position: body straight, arms extended (shoulder farther from hip)
+    
+    # Even more permissive thresholds to improve detection
+    is_down = shoulder_hip_dist < shoulder_width * 0.7  # Even more relaxed threshold
+    is_up = shoulder_hip_dist > shoulder_width * 0.3   # Even more relaxed threshold
+    
+    # Even more permissive body angle check
+    if is_down and body_angle < 0.7 and hands_close:  # Much more permissive body straightness check and hands must be close
+        return "DOWN"
+    elif is_up and body_angle < 0.7 and hands_close:  # Much more permissive body straightness check and hands must be close
+        return "UP"
+    return "MID"
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
